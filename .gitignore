@@ -1,0 +1,11 @@
+# data files
+*.mat
+*.npz
+
+# python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# system files
+.DS_Store
