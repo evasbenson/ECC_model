@@ -88,9 +88,9 @@ def allocate_water(waterflux, waterNeed):
     np.put_along_axis(lDemMet, idxs, lDemMetSort, axis=2)
 
     # reallocated waterflux
-    demandFrac = np.where(demandSum[..., np.newaxis] > 0,
-                      waterDemand / (demandSum[..., np.newaxis] + 1e-10),
-                      0.0)
+    demandFrac    = np.where(demandSum[..., np.newaxis] > 0,
+                             waterDemand / demandSum[..., np.newaxis],
+                             0.0)
     waterflux_irr = (fluxSum - resid)[..., np.newaxis] * demandFrac + lDemMet * latentDemand
 
     return waterflux_irr

@@ -19,7 +19,6 @@ def load_spatial_data(filepath='hcc_spatial_input.mat'):
     Loads the HCC spatial input data from the .mat file.
 
     Returns
-    -------
     PAR : (180, 360, 365) — photosynthetically active radiation (MJ/m2/day)
     area : (180, 360) — grid cell area (m2)
     farmedPct : (180, 360) — fraction of cell currently farmed
@@ -44,14 +43,12 @@ def get_kcal_per_ha(PAR, eimat, area, tau):
     Computes annual food productivity per hectare for each grid cell.
 
     Parameters
-    ----------
     PAR : (180, 360, 365) — photosynthetically active radiation
     eimat : (180, 360, 365) — light interception efficiency
     area : (180, 360) — grid cell area in m2
     tau : float — technology level in [0, 1]
 
     Returns
-    -------
     kcal_per_ha : (180, 360) — food productivity in kcal/ha/yr
     area_ha : (180, 360) — grid cell area in hectares
     """
@@ -107,12 +104,10 @@ def effective_par_from_g(eff_g, tau):
     changing ecc_optimization.py.
 
     Parameters
-    ----------
     eff_g : float — effective g in kcal/ha/yr
     tau : float — technology level
 
     Returns
-    -------
     float : effective PAR in MJ/m2/yr
     """
     conversion     = tau * (0.123 - 0.123 / 2.5) + 0.123 / 2.5
