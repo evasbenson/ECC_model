@@ -1,268 +1,206 @@
 """
-translated from ECC_optimization.m
-uses cyipopt (IPOPT solver) which is the closest python equivalent to 
-matlab's fmincon with the interior-point algorithm. both are primal-dual 
-interior-point barrier methods so the results should be very close.
+ecc_optimization.py
+
+Translated from ECC_optimization_v5.m
+
+Key changes from previous version:
+- Food and energy production now use tanh() saturation functions
+- Energy N is produced with tanh(c2 * K_n^eta_k * L_n^eta_l / H_n)
+- Food F uses tanh(c1 * K_f^alpha_k * L_f^alpha_l * N_f^alpha_n / H_f)
+- Decision variables: n_y_frac, n_f_frac are fractions of total energy N
+  (energy adding-up: n_y_frac + n_f_frac = 1)
+- Capital K is passed in directly (not derived from kmax/nmax scaling)
+- x0 is hardcoded [0.1, 0.2, 0.7, ...] as in MATLAB version
+- Returns Y (aggregate production) in addition to solution and utility
 """
 
 import numpy as np
 from cyipopt import minimize_ipopt
 
 
-def ecc_optimization(population, technology, parameters):
+def ecc_optimization(population, technology, K, parameters):
     """
-    solves the constrained utility maximization for a given population and
-    technology level. this is a direct translation of the matlab function
-    that uses fmincon with interior-point.
+    Solves the constrained utility maximization for a given population,
+    technology level, and capital stock K.
 
-    the decision variables x are 11 shares/fractions that describe how
-    capital, labor, energy, and land are allocated across three sectors:
-    aggregate goods (y), food (f), and energy (n).
+    Decision variables x (11 elements):
+      x[0]  = K_y / K      — capital share for aggregate good
+      x[1]  = K_f / K      — capital share for food
+      x[2]  = K_n / K      — capital share for energy
+      x[3]  = L_y / L      — labor share for aggregate good
+      x[4]  = L_f / L      — labor share for food
+      x[5]  = L_n / L      — labor share for energy
+      x[6]  = n_y_frac     — fraction of energy N to aggregate good
+      x[7]  = n_f_frac     — fraction of energy N to food
+      x[8]  = H_y / H      — land share for aggregate good
+      x[9]  = H_f / H      — land share for food
+      x[10] = H_n / H      — land share for energy
 
-    x = [k_y/k, k_f/k, k_n/k, l_y, l_f, l_n, n_y/n, n_f/n, h_y/h, h_f/h, h_n/h]
+    Parameters
+    ----------
+    population : float — population in billions
+    technology : float — tau in [0, 1]
+    K : float — current capital stock
+    parameters : dict — from ecc_parameters.get_parameters()
 
-    args:
-        population: population in billions
-        technology: tech level between 0 (current) and 1 (maximal)
-        parameters: dict of model parameters from ecc_parameters.py
-
-    returns:
-        equilibrium: optimal allocation array (11 elements)
-        negutility: negative of utility at optimum (since we minimize)
-        exitflag: 1=success, -2=infeasible, 0=max iter, -1=failure
+    Returns
+    -------
+    equilibrium : array (11,) — optimal allocation
+    negutility : float — negative utility (minimized)
+    Y : float — aggregate production at optimum
+    exitflag : int — 1=success, -2=infeasible, 0=max iter, -1=failure
     """
-
-    # set population, technology, and labor
-    # same as the matlab function preamble
-    pop = population
-    tau = technology
+    pop  = population
+    tau  = technology
     lfpr = parameters['lfpr']
-    H = parameters['H']
-    L = lfpr * pop  # total labor endowment in billions
+    H    = parameters['H']
+    L    = lfpr * pop
 
-    # utility parameters
-    mu0 = parameters['mu0']
-    mu1 = parameters['mu1']
-
-    # calorie requirement
+    mu_c    = parameters['mu_c']
+    mu_f    = parameters['mu_f']
     kcalmin = parameters['kcalmin']
+    s       = parameters['s']
 
-    # savings rate
-    s = parameters['s']
+    gamma_k = parameters['gamma_k']
+    gamma_l = parameters['gamma_l']
+    gamma_n = parameters['gamma_n']
+    gamma_h = parameters['gamma_h']
 
-    # aggregate production function parameters
-    A = parameters['A']
-    gamma0 = parameters['gamma0']
-    gamma1 = parameters['gamma1']
-    gamma2 = parameters['gamma2']
-    gamma3 = parameters['gamma3']
+    PAR      = parameters['PAR']
+    PAR_kcal = 2390060 * PAR   
+    alpha_k  = parameters['alpha_k']
+    alpha_l  = parameters['alpha_l']
+    alpha_n  = parameters['alpha_n']
+    c1       = parameters['c1']
 
-    # food production parameters
-    PAR = parameters['PAR']
-    PAR_kcal = 2390060 * PAR  # converts PAR to kcal per hectare
-    alpha0 = parameters['alpha0']
-    alpha1 = parameters['alpha1']
-    alpha2 = parameters['alpha2']
+    eta_k = parameters['eta_k']
+    eta_l = parameters['eta_l']
+    c2    = parameters['c2']
+    ece   = tau * (0.868 - 0.22) + 0.22  
 
-    # energy production parameters
-    eta0 = parameters['eta0']
-    eta1 = parameters['eta1']
-    ece = tau * (0.868 - 0.22) + 0.22  # solar energy conversion efficiency
+    conversion = tau * (0.123 - 0.123 / 2.5) + 0.123 / 2.5
+    harvest    = 1.0 - (tau * (0.0 - 0.5) + 0.5)
+    g          = PAR_kcal * harvest * conversion   
 
-    # scaling parameters that come from the fixed-point iteration in the wrapper
-    sols_analytic = parameters['sols']
-    kmax = parameters['kmax']
-    nmax = parameters['nmax']
-
-    # -------------------------------------------------------------------------
-    # objective function: negative utility for minimization
-    # direct translation of the nested utility(x,tau) function in the matlab,
-    # wrapped as objfunhandle = @(x) -utility(x,tau)
-    # -------------------------------------------------------------------------
     def objective(x):
-        # unpack control variables exactly like the matlab code
-        k_y = x[0] * kmax       # capital for aggregate good
-        l_y = x[3]              # labor for aggregate good
-        n_y = x[6] * nmax       # energy for aggregate good
-        h_y = x[8] * (H / L)   # land for aggregate good
+        K_y      = x[0] * K
+        K_f      = x[1] * K
+        K_n      = x[2] * K
+        L_y      = x[3] * L
+        L_f      = x[4] * L
+        L_n      = x[5] * L
+        n_y_frac = x[6]
+        n_f_frac = x[7]
+        H_y      = x[8]  * H
+        H_f      = x[9]  * H
+        H_n      = x[10] * H
 
-        k_f = x[1] * kmax       # capital for food
-        l_f = x[4]              # labor for food
-        n_f = x[7] * nmax       # energy for food
-        h_f = x[9] * (H / L)   # land for food
+        N   = ece * PAR * H_n * np.tanh(c2 * K_n**eta_k * L_n**eta_l / H_n)
+        N_y = N * n_y_frac
+        N_f = N * n_f_frac
 
-        # set technical efficiency parameters (depends on technology level)
-        conversion = tau * (0.123 - 0.123 / 2.5) + 0.123 / 2.5  # PAR to biomass
-        harvest = 1 - (tau * (0 - 0.5) + 0.5)  # harvestable fraction
-        g = PAR_kcal * harvest * conversion  # max kcal production per hectare
+        Y   = K_y**gamma_k * L_y**gamma_l * N_y**gamma_n * H_y**gamma_h
+        C   = (1 - s) * Y
+        c_pc = C / pop
 
-        # calculate aggregate production (cobb-douglas)
-        y = A * k_y**gamma0 * l_y**gamma1 * n_y**gamma2 * h_y**gamma3
+        F    = g * H_f * np.tanh(c1 * K_f**alpha_k * L_f**alpha_l * N_f**alpha_n / H_f)
+        f_pc = F / pop
 
-        # consumption per worker then per capita
-        c = (1 - s) * y
-        c_pc = c * lfpr
-
-        # food production per worker then per capita
-        f = g * h_f * (k_f / kmax)**alpha0 * l_f**alpha1 * (n_f / nmax)**alpha2
-        f_pc = f * lfpr
-
-        # utility function: u = c_pc^mu0 * f_pc^mu1
-        u = c_pc**mu0 * f_pc**mu1
+        u = (c_pc ** mu_c) * (f_pc ** mu_f)
         return -u
 
-    # -------------------------------------------------------------------------
-    # constraint functions
-    # translated from the nested nonlincon(x) function in the matlab code
-    # matlab's nonlincon returns [c, ceq] where c <= 0 and ceq = 0
-    # for ipopt we split them into separate dicts with the right sign conventions
-    # -------------------------------------------------------------------------
-    def energy_balance(x):
-        """equality constraint: energy produced = energy used
-        this is ceq in the matlab code: ceq = n_y + n_f - n"""
-        k_n = x[2] * kmax
-        l_n = x[5]
-        n_y = x[6] * nmax
-        n_f = x[7] * nmax
-        h_n = x[10] * (H / L)
-
-        # energy production per worker
-        n = ece * PAR * h_n * (k_n / kmax)**eta0 * l_n**eta1
-        return n_y + n_f - n
+    def get_Y(x):
+        """Compute aggregate production for convergence check."""
+        K_y      = x[0] * K
+        L_y      = x[3] * L
+        n_y_frac = x[6]
+        H_y      = x[8]  * H
+        H_n      = x[10] * H
+        K_n      = x[2]  * K
+        L_n      = x[5]  * L
+        N        = ece * PAR * H_n * np.tanh(c2 * K_n**eta_k * L_n**eta_l / H_n)
+        N_y      = N * n_y_frac
+        return K_y**gamma_k * L_y**gamma_l * N_y**gamma_n * H_y**gamma_h
 
     def calorie_surplus(x):
-        """inequality constraint: must produce enough calories
-        matlab has c = kcalmin - f_pc (where c <= 0)
-        we flip it to f_pc - kcalmin >= 0 for ipopt's convention"""
-        k_f = x[1] * kmax
-        l_f = x[4]
-        n_f = x[7] * nmax
-        h_f = x[9] * (H / L)
-
-        conversion = tau * (0.123 - 0.123 / 2.5) + 0.123 / 2.5
-        harvest = 1 - (tau * (0 - 0.5) + 0.5)
-        g = PAR_kcal * harvest * conversion
-
-        f = g * h_f * (k_f / kmax)**alpha0 * l_f**alpha1 * (n_f / nmax)**alpha2
-        f_pc = f * lfpr
+        """Caloric constraint: f_pc >= kcalmin  (>= 0 for ipopt)"""
+        K_f      = x[1] * K
+        L_f      = x[4] * L
+        n_f_frac = x[7]
+        H_f      = x[9]  * H
+        H_n      = x[10] * H
+        K_n      = x[2]  * K
+        L_n      = x[5]  * L
+        N        = ece * PAR * H_n * np.tanh(c2 * K_n**eta_k * L_n**eta_l / H_n)
+        N_f      = N * n_f_frac
+        F        = g * H_f * np.tanh(c1 * K_f**alpha_k * L_f**alpha_l * N_f**alpha_n / H_f)
+        f_pc     = F / pop
         return f_pc - kcalmin
 
-    # set up constraints for ipopt
-    # the linear equalities match matlab's Aeq * x = beq (capital, labor, land sum to 1)
-    # the nonlinear constraints match matlab's nonlincon function
     constraints = [
-        {'type': 'eq', 'fun': lambda x: x[0] + x[1] + x[2] - 1.0},   # capital adding-up
-        {'type': 'eq', 'fun': lambda x: x[3] + x[4] + x[5] - 1.0},   # labor adding-up
-        {'type': 'eq', 'fun': lambda x: x[8] + x[9] + x[10] - 1.0},  # land adding-up
-        {'type': 'eq', 'fun': energy_balance},                          # energy balance
-        {'type': 'ineq', 'fun': calorie_surplus},                       # calorie floor
+        {'type': 'eq',   'fun': lambda x: x[0] + x[1] + x[2] - 1.0},   
+        {'type': 'eq',   'fun': lambda x: x[3] + x[4] + x[5] - 1.0},   
+        {'type': 'eq',   'fun': lambda x: x[6] + x[7] - 1.0},           
+        {'type': 'eq',   'fun': lambda x: x[8] + x[9] + x[10] - 1.0},  
+        {'type': 'ineq', 'fun': calorie_surplus},                         
     ]
 
-    # variable bounds: lb = 0.0001, ub = 0.9999 (same as matlab)
     bounds = [(0.0001, 0.9999)] * 11
 
-    # initial guess from analytic solution (same as matlab's x0 = sols_analytic)
-    x0 = np.clip(sols_analytic.copy(), 0.0001, 0.9999)
+    x0 = np.array([0.1, 0.2, 0.7, 0.1, 0.2, 0.7, 0.3, 0.7, 0.1, 0.2, 0.7])
 
-    # ipopt options chosen to match matlab's fmincon interior-point settings as closely
-    # as possible. both solvers are interior-point barrier methods so these map well.
-    # the matlab code uses tighter tolerances for larger populations (L >= 2)
     if L < 2:
         options = {
-            'print_level': 0,                       # like Display='off' in matlab
-            'sb': 'yes',                             # suppress the ipopt startup banner
-            'max_iter': 3000,                        # matches MaxIterations=3000
-            'tol': 1e-7,                             # matches OptimalityTolerance=1e-7
-            'constr_viol_tol': 1e-7,                 # matches ConstraintTolerance=1e-7
-            'acceptable_tol': 1e-6,
+            'print_level': 0, 'sb': 'yes',
+            'max_iter': 3000, 'tol': 1e-7,
+            'constr_viol_tol': 1e-7, 'acceptable_tol': 1e-6,
             'acceptable_constr_viol_tol': 1e-6,
-            'nlp_scaling_method': 'gradient-based',  # matches ScaleProblem=true
-            'mu_strategy': 'adaptive',               # adaptive barrier parameter
+            'nlp_scaling_method': 'gradient-based',
+            'mu_strategy': 'adaptive',
         }
     else:
         options = {
-            'print_level': 0,
-            'sb': 'yes',
-            'max_iter': 2000,                        # matches MaxIterations=2000
-            'tol': 1e-8,                             # matches OptimalityTolerance=1e-8
-            'constr_viol_tol': 1e-8,                 # matches ConstraintTolerance=1e-8
-            'acceptable_tol': 1e-7,
+            'print_level': 0, 'sb': 'yes',
+            'max_iter': 3000, 'tol': 1e-8,
+            'constr_viol_tol': 1e-8, 'acceptable_tol': 1e-7,
             'acceptable_constr_viol_tol': 1e-7,
             'nlp_scaling_method': 'gradient-based',
             'mu_strategy': 'adaptive',
         }
 
-    # solve using ipopt (this is the equivalent of the fmincon call in matlab)
     try:
-        result = minimize_ipopt(
-            objective, x0,
-            bounds=bounds,
-            constraints=constraints,
-            options=options
-        )
-        exitflag = _map_exit_flag(result, energy_balance, calorie_surplus)
-        return result.x, result.fun, exitflag
+        result   = minimize_ipopt(objective, x0, bounds=bounds,
+                                  constraints=constraints, options=options)
+        exitflag = _map_exit_flag(result, calorie_surplus)
+        Y_val    = get_Y(result.x)
+        return result.x, result.fun, Y_val, exitflag
     except Exception:
-        # if ipopt completely crashes, return the initial guess with failure flag
-        return x0, objective(x0), -1
+        return x0, objective(x0), 0.0, -1
 
 
-def _map_exit_flag(result, energy_fn, calorie_fn):
-    """
-    maps ipopt result to matlab fmincon-style exit flags.
-
-    instead of just trusting the ipopt status code, we check whether the
-    solution actually satisfies the constraints. ipopt can return non-zero
-    status codes (like -2=restoration_failed, 3=search_direction_too_small)
-    even when the solution is perfectly usable. matlab's fmincon is more
-    lenient in what it considers "success", so we check constraints directly.
-
-    returns:
-        1  = success (constraints satisfied, objective finite)
-        -2 = infeasible (caloric constraint violated)
-        0  = max iterations exceeded
-        -1 = genuine failure (constraints not satisfied)
-    """
-    x = result.x
+def _map_exit_flag(result, calorie_fn):
+    x      = result.x
     status = getattr(result, 'status', -100)
-
-    # check if the solution actually satisfies constraints
-    # this is more robust than relying on ipopt's status code alone
     try:
-        k_sum_err = abs(x[0] + x[1] + x[2] - 1.0)
-        l_sum_err = abs(x[3] + x[4] + x[5] - 1.0)
-        h_sum_err = abs(x[8] + x[9] + x[10] - 1.0)
-        energy_err = abs(energy_fn(x))
-        cal_surplus = calorie_fn(x)
-
-        linear_ok = max(k_sum_err, l_sum_err, h_sum_err) < 1e-4
-        energy_ok = energy_err < 1e-4
-        calorie_ok = cal_surplus >= -1e-4
+        k_err  = abs(x[0] + x[1] + x[2] - 1.0)
+        l_err  = abs(x[3] + x[4] + x[5] - 1.0)
+        e_err  = abs(x[6] + x[7] - 1.0)
+        h_err  = abs(x[8] + x[9] + x[10] - 1.0)
+        cal    = calorie_fn(x)
+        lin_ok = max(k_err, l_err, e_err, h_err) < 1e-4
+        cal_ok = cal >= -1e-4
         obj_ok = np.isfinite(result.fun)
     except Exception:
-        # if we can't even evaluate constraints, it's a failure
         return -1
 
-    # if calorie constraint is badly violated, it's infeasible
-    if cal_surplus < -1e-2:
+    if cal < -1e-2:
         return -2
-
-    # if all constraints are satisfied and objective is finite, accept it
-    # regardless of what ipopt's status code says
-    if linear_ok and energy_ok and calorie_ok and obj_ok:
+    if lin_ok and cal_ok and obj_ok:
         return 1
-
-    # if ipopt explicitly says infeasible, trust that
     if status == 2:
         return -2
-
-    # if ipopt says max iterations, report that
     if status == -1:
         return 0
-
-    # calorie constraint is close to violated — likely infeasible region
-    if not calorie_ok:
+    if not cal_ok:
         return -2
-
-    # everything else is a genuine failure
     return -1

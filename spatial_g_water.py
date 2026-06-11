@@ -31,7 +31,6 @@ def load_spatial_data(filepath='hcc_spatial_input.mat'):
     waterflux    = data['waterflux']
     irrigatedPct = data['irrigatedPct']
 
-    # land mask: only cells that are currently farmed with nonzero EI
     ei_mean = np.mean(eimat, axis=2)
     is_land = (ei_mean > 0) & (farmedPct > 0)
 
@@ -54,40 +53,30 @@ def allocate_water(waterflux, waterNeed):
     -------
     waterflux_irr : (180, 360, 365) — adjusted waterflux after irrigation
     """
-    # days with positive water balance (surplus days)
     noGap    = (waterflux >= 0).astype(float)
-    fluxSum  = np.sum(waterflux * noGap, axis=2)       # total surplus per cell
+    fluxSum  = np.sum(waterflux * noGap, axis=2)       
 
-    # water demand on growing days
-    # growperiod is implicitly all days where waterNeed > 0
     growperiod   = (waterNeed > 0).astype(float)
     waterDemand  = noGap * growperiod * waterNeed
     demandSum    = np.sum(waterDemand, axis=2)
 
-    # residual surplus after meeting demand on surplus days
     resid = np.clip(fluxSum - demandSum, 0, None)
 
-    # latent demand: deficit on non-surplus growing days
     latentDemand = (1 - noGap) * growperiod * np.maximum(0, waterNeed - waterflux)
 
-    # relative shortfall per day (used for sorting priority)
     gapFrac = np.where(latentDemand > 0,
                        (1 - noGap) * growperiod * np.maximum(0, -waterflux) / (latentDemand + 1e-10),
                        0.0)
 
-    # sort days by relative shortfall (ascending) — fill easiest deficits first
     idxs          = np.argsort(gapFrac, axis=2)
     latentDemSort = np.take_along_axis(latentDemand, idxs, axis=2)
     cumldem       = np.cumsum(latentDemSort, axis=2)
 
-    # mark days where reallocated water is sufficient to meet latent demand
     lDemMetSort = cumldem <= resid[..., np.newaxis]
 
-    # reverse sort to restore original time ordering
     lDemMet = np.zeros_like(lDemMetSort)
     np.put_along_axis(lDemMet, idxs, lDemMetSort, axis=2)
 
-    # reallocated waterflux
     demandFrac    = np.where(demandSum[..., np.newaxis] > 0,
                              waterDemand / demandSum[..., np.newaxis],
                              0.0)
@@ -122,74 +111,54 @@ def get_kcal_per_ha(PAR, eimat, area, tau,
     """
     conversion   = tau * (0.123 - 0.123 / 2.5) + 0.123 / 2.5
     harvest      = 1.0 - (tau * (0.0 - 0.5) + 0.5)
-    potentialNPP = conversion * eimat * PAR       # MJ/m2/day
+    potentialNPP = conversion * eimat * PAR       
 
     if waterflux is not None:
-        # water need per day (kg/m2/day) — from humanlimits.py line 117
-        # 0.037663 kg water per MJ of potential NPP
         waterNeed = 0.037663 * potentialNPP
 
         if use_irrigation and irrigatedPct is not None:
-            # run irrigation water allocation algorithm
             waterflux_irr = allocate_water(waterflux, waterNeed)
 
-            # non-irrigated actual NPP: limited by raw waterflux
             water_factor_rain = np.clip(
                 waterflux / (waterNeed + 1e-10), 0, 1
             )
             actualNPP_rain = potentialNPP * water_factor_rain
 
-            # irrigated actual NPP: limited by reallocated waterflux
             water_factor_irr = np.clip(
                 waterflux_irr / (waterNeed + 1e-10), 0, 1
             )
             actualNPP_irr = potentialNPP * water_factor_irr
 
-            # blend rainfed and irrigated based on irrigatedPct
-            irr = irrigatedPct[..., np.newaxis]   # broadcast over time axis
+            irr = irrigatedPct[..., np.newaxis]  
             actualNPP = (1 - irr) * actualNPP_rain + irr * actualNPP_irr
 
         else:
-            # rainfed only
             water_factor = np.clip(waterflux / (waterNeed + 1e-10), 0, 1)
             actualNPP    = potentialNPP * water_factor
 
     else:
-        # no water data — use potential NPP (original aspatial behavior)
         actualNPP = potentialNPP
 
-    annualNPP   = np.sum(actualNPP, axis=2)       # MJ/m2/yr
-    kcal_per_m2 = 239.006 * harvest * annualNPP   # kcal/m2/yr
-    kcal_per_ha = kcal_per_m2 * 10000             # kcal/ha/yr
-    area_ha     = area / 10000                    # m2 -> ha
+    annualNPP   = np.sum(actualNPP, axis=2)       
+    kcal_per_m2 = 239.006 * harvest * annualNPP   
+    kcal_per_ha = kcal_per_m2 * 10000             
+    area_ha     = area / 10000                    
 
     return kcal_per_ha, area_ha
 
 
-def compute_effective_g(kcal_per_ha, area_ha, farmedPct, h_food_share, is_land):
+def compute_effective_g_and_ei(kcal_per_ha, area_ha, farmedPct, 
+                                h_food_share, is_land, eimat):
     """
-    Computes the production-weighted average food productivity (g)
-    for the land allocated to food production.
-
-    Ranks ALL land cells by productivity (best first). As h_food_share
-    increases, progressively less productive cells are included,
-    capturing diminishing returns to land expansion.
-
-    Parameters
-    ----------
-    kcal_per_ha : (180, 360) — food productivity per cell
-    area_ha : (180, 360) — cell area in hectares
-    farmedPct : (180, 360) — currently farmed fraction per cell
-    h_food_share : float — fraction of total land for food
-    is_land : (180, 360) bool — land mask
-
-    Returns
-    -------
-    float : effective g in kcal/ha/yr
+    Returns both effective g AND production-weighted average EI
+    for the selected food cells.
     """
+    ei_annual = np.mean(eimat, axis=2)  
+    
     g_flat    = kcal_per_ha.ravel()
     area_flat = area_ha.ravel()
     land_flat = is_land.ravel()
+    ei_flat   = ei_annual.ravel()
 
     total_land_ha = float(np.nansum(area_flat * land_flat))
     target_ha     = h_food_share * total_land_ha
@@ -197,17 +166,40 @@ def compute_effective_g(kcal_per_ha, area_ha, farmedPct, h_food_share, is_land):
     order       = np.argsort(-g_flat)
     accumulated = 0.0
     weighted_g  = 0.0
+    weighted_ei = 0.0
 
     for idx in order:
         if not land_flat[idx] or area_flat[idx] <= 0:
             continue
         if accumulated >= target_ha:
             break
-        take        = min(area_flat[idx], target_ha - accumulated)
-        weighted_g += g_flat[idx] * take
+        take         = min(area_flat[idx], target_ha - accumulated)
+        weighted_g  += g_flat[idx] * take
+        weighted_ei += ei_flat[idx] * take
         accumulated += take
 
-    return weighted_g / accumulated if accumulated > 0 else 0.0
+    eff_g  = weighted_g  / accumulated if accumulated > 0 else 0.0
+    eff_ei = weighted_ei / accumulated if accumulated > 0 else 1.0
+    return eff_g, eff_ei
+
+
+def effective_par_from_g(eff_g, eff_ei, tau):
+    """
+    Back-calculates effective PAR accounting for EI.
+    
+    The food production formula is:
+        kcal = 239.006 * harvest * conversion * EI * PAR * 10000
+    So:
+        effective_PAR = eff_g / (239.006 * 10000 * harvest * conversion * eff_ei)
+    """
+    conversion     = tau * (0.123 - 0.123 / 2.5) + 0.123 / 2.5
+    harvest        = 1.0 - (tau * (0.0 - 0.5) + 0.5)
+    PAR_KCAL_SCALE = 239.006 * 10000
+    tech_scale     = harvest * conversion * eff_ei  
+    if tech_scale > 0:
+        return eff_g / (PAR_KCAL_SCALE * tech_scale)
+    else:
+        return 2164.5
 
 
 def effective_par_from_g(eff_g, tau):
@@ -234,4 +226,4 @@ def effective_par_from_g(eff_g, tau):
     if tech_scale > 0:
         return eff_g / (PAR_KCAL_SCALE * tech_scale)
     else:
-        return 2164.5  # fall back to aspatial default at tau=0
+        return 2164.5 
