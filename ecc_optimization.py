@@ -4,14 +4,11 @@ ecc_optimization.py
 Translated from ECC_optimization_v5.m
 
 Key changes from previous version:
-- Food and energy production now use tanh() saturation functions
-- Energy N is produced with tanh(c2 * K_n^eta_k * L_n^eta_l / H_n)
-- Food F uses tanh(c1 * K_f^alpha_k * L_f^alpha_l * N_f^alpha_n / H_f)
-- Decision variables: n_y_frac, n_f_frac are fractions of total energy N
-  (energy adding-up: n_y_frac + n_f_frac = 1)
-- Capital K is passed in directly (not derived from kmax/nmax scaling)
-- x0 is hardcoded [0.1, 0.2, 0.7, ...] as in MATLAB version
-- Returns Y (aggregate production) in addition to solution and utility
+- Food and energy production use tanh() saturation
+- Capital K passed in directly
+- Energy adding-up: n_y_frac + n_f_frac = 1
+- A parameter now read from parameters dict (default 1.0)
+- x0 hardcoded as in MATLAB
 """
 
 import numpy as np
@@ -46,7 +43,7 @@ def ecc_optimization(population, technology, K, parameters):
     Returns
     -------
     equilibrium : array (11,) — optimal allocation
-    negutility : float — negative utility (minimized)
+    negutility : float — negative utility at optimum
     Y : float — aggregate production at optimum
     exitflag : int — 1=success, -2=infeasible, 0=max iter, -1=failure
     """
@@ -61,13 +58,17 @@ def ecc_optimization(population, technology, K, parameters):
     kcalmin = parameters['kcalmin']
     s       = parameters['s']
 
+    # A scales aggregate production — read from params, default 1.0
+    A = parameters.get('A', 1.0)
+
     gamma_k = parameters['gamma_k']
     gamma_l = parameters['gamma_l']
     gamma_n = parameters['gamma_n']
     gamma_h = parameters['gamma_h']
 
-    PAR      = parameters['PAR']
-    PAR_kcal = 2390060 * PAR   
+    PAR      = parameters['PAR']          # global PAR — for solar energy
+    PAR_ag   = parameters.get('PAR_ag', parameters['PAR'])  # agricultural PAR — for food
+    PAR_kcal = 2390060 * PAR_ag 
     alpha_k  = parameters['alpha_k']
     alpha_l  = parameters['alpha_l']
     alpha_n  = parameters['alpha_n']
@@ -76,11 +77,11 @@ def ecc_optimization(population, technology, K, parameters):
     eta_k = parameters['eta_k']
     eta_l = parameters['eta_l']
     c2    = parameters['c2']
-    ece   = tau * (0.868 - 0.22) + 0.22  
+    ece   = tau * (0.868 - 0.22) + 0.22
 
     conversion = tau * (0.123 - 0.123 / 2.5) + 0.123 / 2.5
     harvest    = 1.0 - (tau * (0.0 - 0.5) + 0.5)
-    g          = PAR_kcal * harvest * conversion   
+    g          = PAR_kcal * harvest * conversion
 
     def objective(x):
         K_y      = x[0] * K
@@ -99,8 +100,8 @@ def ecc_optimization(population, technology, K, parameters):
         N_y = N * n_y_frac
         N_f = N * n_f_frac
 
-        Y   = K_y**gamma_k * L_y**gamma_l * N_y**gamma_n * H_y**gamma_h
-        C   = (1 - s) * Y
+        Y    = A * K_y**gamma_k * L_y**gamma_l * N_y**gamma_n * H_y**gamma_h
+        C    = (1 - s) * Y
         c_pc = C / pop
 
         F    = g * H_f * np.tanh(c1 * K_f**alpha_k * L_f**alpha_l * N_f**alpha_n / H_f)
@@ -110,20 +111,17 @@ def ecc_optimization(population, technology, K, parameters):
         return -u
 
     def get_Y(x):
-        """Compute aggregate production for convergence check."""
-        K_y      = x[0] * K
-        L_y      = x[3] * L
-        n_y_frac = x[6]
-        H_y      = x[8]  * H
-        H_n      = x[10] * H
-        K_n      = x[2]  * K
-        L_n      = x[5]  * L
-        N        = ece * PAR * H_n * np.tanh(c2 * K_n**eta_k * L_n**eta_l / H_n)
-        N_y      = N * n_y_frac
-        return K_y**gamma_k * L_y**gamma_l * N_y**gamma_n * H_y**gamma_h
+        K_y  = x[0] * K
+        L_y  = x[3] * L
+        H_y  = x[8]  * H
+        H_n  = x[10] * H
+        K_n  = x[2]  * K
+        L_n  = x[5]  * L
+        N    = ece * PAR * H_n * np.tanh(c2 * K_n**eta_k * L_n**eta_l / H_n)
+        N_y  = N * x[6]
+        return A * K_y**gamma_k * L_y**gamma_l * N_y**gamma_n * H_y**gamma_h
 
     def calorie_surplus(x):
-        """Caloric constraint: f_pc >= kcalmin  (>= 0 for ipopt)"""
         K_f      = x[1] * K
         L_f      = x[4] * L
         n_f_frac = x[7]
@@ -138,35 +136,27 @@ def ecc_optimization(population, technology, K, parameters):
         return f_pc - kcalmin
 
     constraints = [
-        {'type': 'eq',   'fun': lambda x: x[0] + x[1] + x[2] - 1.0},   
-        {'type': 'eq',   'fun': lambda x: x[3] + x[4] + x[5] - 1.0},   
-        {'type': 'eq',   'fun': lambda x: x[6] + x[7] - 1.0},           
-        {'type': 'eq',   'fun': lambda x: x[8] + x[9] + x[10] - 1.0},  
-        {'type': 'ineq', 'fun': calorie_surplus},                         
+        {'type': 'eq',   'fun': lambda x: x[0] + x[1] + x[2] - 1.0},
+        {'type': 'eq',   'fun': lambda x: x[3] + x[4] + x[5] - 1.0},
+        {'type': 'eq',   'fun': lambda x: x[6] + x[7] - 1.0},
+        {'type': 'eq',   'fun': lambda x: x[8] + x[9] + x[10] - 1.0},
+        {'type': 'ineq', 'fun': calorie_surplus},
     ]
 
     bounds = [(0.0001, 0.9999)] * 11
 
     x0 = np.array([0.1, 0.2, 0.7, 0.1, 0.2, 0.7, 0.3, 0.7, 0.1, 0.2, 0.7])
 
-    if L < 2:
-        options = {
-            'print_level': 0, 'sb': 'yes',
-            'max_iter': 3000, 'tol': 1e-7,
-            'constr_viol_tol': 1e-7, 'acceptable_tol': 1e-6,
-            'acceptable_constr_viol_tol': 1e-6,
-            'nlp_scaling_method': 'gradient-based',
-            'mu_strategy': 'adaptive',
-        }
-    else:
-        options = {
-            'print_level': 0, 'sb': 'yes',
-            'max_iter': 3000, 'tol': 1e-8,
-            'constr_viol_tol': 1e-8, 'acceptable_tol': 1e-7,
-            'acceptable_constr_viol_tol': 1e-7,
-            'nlp_scaling_method': 'gradient-based',
-            'mu_strategy': 'adaptive',
-        }
+    options = {
+        'print_level': 0, 'sb': 'yes',
+        'max_iter': 3000,
+        'tol': 1e-8,
+        'constr_viol_tol': 1e-8,
+        'acceptable_tol': 1e-7,
+        'acceptable_constr_viol_tol': 1e-7,
+        'nlp_scaling_method': 'gradient-based',
+        'mu_strategy': 'adaptive',
+    }
 
     try:
         result   = minimize_ipopt(objective, x0, bounds=bounds,
@@ -175,7 +165,7 @@ def ecc_optimization(population, technology, K, parameters):
         Y_val    = get_Y(result.x)
         return result.x, result.fun, Y_val, exitflag
     except Exception:
-        return x0, objective(x0), 0.0, -1
+        return x0, objective(x0), get_Y(x0), -1
 
 
 def _map_exit_flag(result, calorie_fn):
